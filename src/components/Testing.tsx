@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /* eslint-disable @typescript-eslint/no-unused-vars */
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb } from 'pdf-lib';
 import { Highlighter, Pen, Type } from 'lucide-react';
@@ -52,7 +52,8 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   // Refs and State Management
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-
+  const renderTaskRef = useRef<any>(null);
+  const pageRef = useRef<any>(null);
   // PDF-related states
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState<number>(1);
@@ -63,7 +64,7 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [currentTool, setCurrentTool] = useState<
     'select' | 'draw' | 'highlight' | 'text'
-  >('select');
+  >('highlight');
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
   const [currentPath, setCurrentPath] = useState<Point[]>([]);
   const [highlightInfo, setHighlightInfo] = useState<{
@@ -74,7 +75,10 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   // Error and UI states
   const [error, setError] = useState<string | null>(null);
   const [annotationColor, setAnnotationColor] = useState<string>('#FFFF00');
-
+  const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
+  const [modalText, setModalText] = useState<string>('');
+  const [modalPosition, setModalPosition] = useState<Point | null>(null);
+  
   // PDF Loading Effect
   useEffect(() => {
     const loadPDF = async () => {
@@ -92,69 +96,115 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     loadPDF();
   }, [pdfUrl]);
 
-  const renderPage = async (
-    pageNumber: number,
-    pdfDocument: pdfjsLib.PDFDocumentProxy | null = pdfDoc
-  ) => {
-    if (!pdfDocument) return;
+  // Memoized render function
+  const renderPage = useCallback(
+    async (
+      pageNumber: number,
+      pdfDocument: pdfjsLib.PDFDocumentProxy | null = pdfDoc
+    ) => {
+      if (!pdfDocument || !canvasRef.current) return;
 
-    const page = await pdfDocument.getPage(pageNumber);
+      // Cancel any ongoing render operation
+      if (renderTaskRef.current) {
+        renderTaskRef.current.cancel();
+      }
+
+      try {
+        // Clear previous page
+        if (pageRef.current) {
+          pageRef.current.cleanup();
+        }
+
+        const page = await pdfDocument.getPage(pageNumber);
+        pageRef.current = page;
+
+        const canvas = canvasRef.current;
+        const context = canvas.getContext('2d');
+        if (!context) return;
+
+        const viewport = page.getViewport({ scale });
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+
+        // Clear the canvas
+        context.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Render PDF page
+        const renderContext = {
+          canvasContext: context,
+          viewport: viewport,
+        };
+
+        renderTaskRef.current = page.render(renderContext);
+        await renderTaskRef.current.promise;
+
+        // Render annotations after the page is complete
+        renderAnnotations();
+      } catch (err) {
+        console.error('Error rendering page:', err);
+        setError('Failed to render page');
+      }
+    },
+    [pdfDoc, scale]
+  );
+
+  // Debounced render annotations function
+  const renderAnnotations = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
     const context = canvas.getContext('2d');
     if (!context) return;
 
-    const viewport = page.getViewport({ scale });
-    canvas.height = viewport.height;
-    canvas.width = viewport.width;
+    // Create an offscreen canvas for double buffering
+    const offscreenCanvas = document.createElement('canvas');
+    offscreenCanvas.width = canvas.width;
+    offscreenCanvas.height = canvas.height;
+    const offscreenContext = offscreenCanvas.getContext('2d');
 
-    // First render the PDF page text and images
-    const renderContext = {
-      canvasContext: context,
-      viewport: viewport,
-    };
-    await page.render(renderContext).promise;
+    if (!offscreenContext) return;
 
-    // Then render annotations on top with proper opacity
-    renderAnnotations();
-  };
+    // Copy the main canvas content to offscreen canvas
+    offscreenContext.drawImage(canvas, 0, 0);
 
-  const renderAnnotations = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const context = canvas.getContext('2d');
-    if (!context) return;
+    // Render existing annotations on the offscreen canvas
+    offscreenContext.save();
+    offscreenContext.globalCompositeOperation = 'multiply';
 
     const pageAnnotations = annotations.filter((a) => a.page === pageNum);
-
-    context.save();
-    context.globalCompositeOperation = 'multiply';
 
     pageAnnotations.forEach((annotation) => {
       switch (annotation.type) {
         case 'highlight':
-          context.globalAlpha = 0.35;
-          renderHighlight(context, annotation);
+          offscreenContext.globalAlpha = 0.35;
+          renderHighlight(offscreenContext, annotation);
           break;
         case 'draw':
-          renderDrawing(context, annotation);
+          renderDrawing(offscreenContext, annotation);
           break;
         case 'text':
-          renderTextAnnotation(context, annotation);
+          renderTextAnnotation(offscreenContext, annotation);
           break;
       }
     });
 
-    if (currentTool === 'draw' && currentPath.length > 1) {
-      renderCurrentDrawing(context);
-    }
+    // Render current highlight in real-time
     if (currentTool === 'highlight' && highlightInfo) {
-      context.globalAlpha = 0.35;
-      renderCurrentHighlight(context);
+      offscreenContext.globalAlpha = 0.35;
+      renderCurrentHighlight(offscreenContext);
     }
 
-    context.restore();
-  };
+    // Render current drawing in real-time
+    if (currentTool === 'draw' && currentPath.length > 1) {
+      renderCurrentDrawing(offscreenContext);
+    }
+
+    offscreenContext.restore();
+
+    // Copy the offscreen canvas back to the main canvas
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(offscreenCanvas, 0, 0);
+  }, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
 
   const renderHighlight = (
     context: CanvasRenderingContext2D,
@@ -220,46 +270,51 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     );
   };
 
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+  // Optimized event handlers
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
 
-    switch (currentTool) {
-      case 'draw':
-        setIsDrawing(true);
-        setCurrentPath([{ x, y }]);
-        break;
-      case 'highlight':
-        setHighlightInfo({ start: { x, y }, current: { x, y } });
-        break;
-      case 'text':
-        handleTextAnnotation(x, y);
-        break;
-    }
-  };
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      switch (currentTool) {
+        case 'draw':
+          setIsDrawing(true);
+          setCurrentPath([{ x, y }]);
+          break;
+        case 'highlight':
+          setHighlightInfo({ start: { x, y }, current: { x, y } });
+          break;
+        case 'text':
+          handleTextAnnotation(x, y);
+          break;
+      }
+    },
+    [currentTool]
+  );
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (currentTool !== 'draw' && currentTool !== 'highlight') return;
-
     const canvas = canvasRef.current;
-    if (!canvas || !isDrawing) return;
+    if (!canvas || (currentTool !== 'highlight' && currentTool !== 'draw'))
+      return;
+
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (currentTool === 'draw') {
+    if (currentTool === 'draw' && isDrawing) {
       setCurrentPath((prev) => [...prev, { x, y }]);
-      renderAnnotations();
+      renderAnnotations(); // Redraw annotations and current drawing
     }
 
     if (currentTool === 'highlight' && highlightInfo) {
       setHighlightInfo((prev) =>
         prev ? { ...prev, current: { x, y } } : null
       );
-      renderAnnotations();
+      renderAnnotations(); // Redraw annotations and current highlight
     }
   };
 
@@ -300,17 +355,10 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   };
 
   const handleTextAnnotation = (x: number, y: number) => {
-    const text = prompt('Enter annotation text:');
-    if (text) {
-      const newAnnotation: TextAnnotation = {
-        type: 'text',
-        page: pageNum,
-        position: { x, y },
-        text,
-        color: annotationColor,
-      };
-      setAnnotations((prev) => [...prev, newAnnotation]);
-    }
+    // Store the position and open the modal
+    setModalPosition({ x, y });
+    setModalText(''); // Clear previous text
+    setIsModalOpen(true);
   };
   // Utility Functions
   const clearAllAnnotations = () => {
@@ -329,7 +377,25 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
 
     return { r, g, b };
   };
-
+  // Function to handle modal submission
+  const handleModalSubmit = () => {
+    if (modalText && modalPosition) {
+      const newAnnotation: TextAnnotation = {
+        type: 'text',
+        page: pageNum,
+        position: modalPosition,
+        text: modalText,
+        color: annotationColor,
+      };
+      setAnnotations((prev) => [...prev, newAnnotation]);
+      setIsModalOpen(false);
+    }
+  };
+  
+  // Function to handle modal cancellation
+  const handleModalCancel = () => {
+    setIsModalOpen(false);
+  };
   const downloadAnnotatedPDF = async () => {
     try {
       // Fetch the original PDF
@@ -439,9 +505,48 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
       console.error('Error downloading annotated PDF:', error);
     }
   };
+  // Cleanup effect
+  useEffect(() => {
+    return () => {
+      if (renderTaskRef.current) {
+        renderTaskRef.current.cancel();
+      }
+      if (pageRef.current) {
+        pageRef.current.cleanup();
+      }
+    };
+  }, []);
   return (
     <div className='w-full max-w-6xl mx-auto p-4'>
       {/* Error Display */}
+      {isModalOpen && (
+  <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
+    <div className="bg-white rounded-lg p-6 shadow-lg w-96">
+      <h2 className="text-lg font-semibold mb-4">Add Text Annotation</h2>
+      <textarea
+        className="w-full border border-gray-300 rounded-lg p-2 h-20"
+        value={modalText}
+        onChange={(e) => setModalText(e.target.value)}
+        placeholder="Enter annotation text here..."
+      />
+      <div className="flex justify-end mt-4 gap-2">
+        <button
+          className="px-4 py-2 bg-gray-300 text-black rounded hover:bg-gray-400"
+          onClick={handleModalCancel}
+        >
+          Cancel
+        </button>
+        <button
+          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+          onClick={handleModalSubmit}
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  </div>
+)}
+
       {error && (
         <div className='bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4'>
           {error}
@@ -459,7 +564,13 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
             className={`cursor-${
-              currentTool === 'text' ? 'text' : 'crosshair'
+              currentTool === 'highlight'
+                ? 'crosshair'
+                : currentTool === 'draw'
+                ? 'crosshair'
+                : currentTool === 'text'
+                ? 'text'
+                : 'default'
             }`}
           />
         </div>

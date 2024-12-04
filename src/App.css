@@ -1,0 +1,25 @@
+.custom-height {
+    height: calc(100vh - 100px);
+  
+  }
+  .custom-boxShadow{
+    box-shadow: rgba(0, 0, 0, 0.15) 0px 2px 8px;
+  }
+
+  .cursor-crosshair {
+    cursor: crosshair;
+  }
+
+  /* Add styles for sticky notes */
+.sticky-note {
+    background-color: #ffeb3b; /* Light yellow */
+    border: 1px solid #fbc02d; /* Darker yellow */
+    padding: 8px;
+    width: 150px;
+    height: 150px;
+    position: absolute;
+    border-radius: 8px;
+    font-family: sans-serif;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+  }
+  
