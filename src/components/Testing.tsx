@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb } from 'pdf-lib';
-import { Highlighter, Pen, Type } from 'lucide-react';
+import { Highlighter, Pen, Redo, Type, Undo } from 'lucide-react';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 // Define types for annotations
@@ -59,7 +59,9 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   const [pageNum, setPageNum] = useState<number>(1);
   const [totalPages, setTotalPages] = useState<number>(0);
   const [scale, setScale] = useState<number>(1.5);
-
+  // Undo/Redo State Management
+  const [annotationStack, setAnnotationStack] = useState<Annotation[][]>([[]]);
+  const [currentStackIndex, setCurrentStackIndex] = useState(0);
   // Annotation-related states
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [currentTool, setCurrentTool] = useState<
@@ -78,6 +80,7 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [modalText, setModalText] = useState<string>('');
   const [modalPosition, setModalPosition] = useState<Point | null>(null);
+
   
   // PDF Loading Effect
   useEffect(() => {
@@ -148,63 +151,154 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     [pdfDoc, scale]
   );
 
-  // Debounced render annotations function
-  const renderAnnotations = useCallback(() => {
+// Modified addAnnotation to properly handle drawing history
+const addAnnotation = useCallback((newAnnotation: Annotation) => {
+  setAnnotations(prevAnnotations => {
+    const updatedAnnotations = [...prevAnnotations, newAnnotation];
+    
+    // Create a new stack entry only when drawing is complete
+    if (!isDrawing || newAnnotation.type !== 'draw') {
+      const newStack = annotationStack.slice(0, currentStackIndex + 1);
+      setAnnotationStack([...newStack, updatedAnnotations]);
+      setCurrentStackIndex(currentStackIndex + 1);
+    }
+    
+    return updatedAnnotations;
+  });
+}, [annotationStack, currentStackIndex, isDrawing]);
+
+// Debounced render annotations function
+const renderAnnotations = useCallback(() => {
+  const canvas = canvasRef.current;
+  if (!canvas) return;
+
+  const context = canvas.getContext('2d');
+  if (!context) return;
+
+  // Create an offscreen canvas for double buffering
+  const offscreenCanvas = document.createElement('canvas');
+  offscreenCanvas.width = canvas.width;
+  offscreenCanvas.height = canvas.height;
+  const offscreenContext = offscreenCanvas.getContext('2d');
+
+  if (!offscreenContext) return;
+
+  // Copy the main canvas content to offscreen canvas
+  offscreenContext.drawImage(canvas, 0, 0);
+
+  // Render existing annotations on the offscreen canvas
+  offscreenContext.save();
+  offscreenContext.globalCompositeOperation = 'multiply';
+
+  const pageAnnotations = annotations.filter((a) => a.page === pageNum);
+
+  pageAnnotations.forEach((annotation) => {
+    switch (annotation.type) {
+      case 'highlight':
+        offscreenContext.globalAlpha = 0.35;
+        renderHighlight(offscreenContext, annotation);
+        break;
+      case 'draw':
+        renderDrawing(offscreenContext, annotation);
+        break;
+      case 'text':
+        renderTextAnnotation(offscreenContext, annotation);
+        break;
+    }
+  });
+
+  // Render current highlight in real-time
+  if (currentTool === 'highlight' && highlightInfo) {
+    offscreenContext.globalAlpha = 0.35;
+    renderCurrentHighlight(offscreenContext);
+  }
+
+  // Render current drawing in real-time
+  if (currentTool === 'draw' && currentPath.length > 1) {
+    renderCurrentDrawing(offscreenContext);
+  }
+
+  offscreenContext.restore();
+
+  // Copy the offscreen canvas back to the main canvas
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(offscreenCanvas, 0, 0);
+}, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
+// Modified handleUndo to render changes
+const handleUndo = useCallback(() => {
+  if (currentStackIndex > 0) {
+    const newIndex = currentStackIndex - 1;
+    setCurrentStackIndex(newIndex);
+    setAnnotations(annotationStack[newIndex]);
+    
+    // Force re-render of the PDF with updated annotations
     const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const context = canvas.getContext('2d');
-    if (!context) return;
-
-    // Create an offscreen canvas for double buffering
-    const offscreenCanvas = document.createElement('canvas');
-    offscreenCanvas.width = canvas.width;
-    offscreenCanvas.height = canvas.height;
-    const offscreenContext = offscreenCanvas.getContext('2d');
-
-    if (!offscreenContext) return;
-
-    // Copy the main canvas content to offscreen canvas
-    offscreenContext.drawImage(canvas, 0, 0);
-
-    // Render existing annotations on the offscreen canvas
-    offscreenContext.save();
-    offscreenContext.globalCompositeOperation = 'multiply';
-
-    const pageAnnotations = annotations.filter((a) => a.page === pageNum);
-
-    pageAnnotations.forEach((annotation) => {
-      switch (annotation.type) {
-        case 'highlight':
-          offscreenContext.globalAlpha = 0.35;
-          renderHighlight(offscreenContext, annotation);
-          break;
-        case 'draw':
-          renderDrawing(offscreenContext, annotation);
-          break;
-        case 'text':
-          renderTextAnnotation(offscreenContext, annotation);
-          break;
+    if (canvas) {
+      const context = canvas.getContext('2d');
+      if (context) {
+        // Clear the canvas
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // Re-render the page
+        if (pageRef.current) {
+          const viewport = pageRef.current.getViewport({ scale });
+          const renderContext = {
+            canvasContext: context,
+            viewport: viewport,
+          };
+          
+          renderTaskRef.current = pageRef.current.render(renderContext);
+          renderTaskRef.current.promise.then(() => {
+            // After page renders, draw the annotations
+            renderAnnotations();
+          });
+        }
       }
-    });
-
-    // Render current highlight in real-time
-    if (currentTool === 'highlight' && highlightInfo) {
-      offscreenContext.globalAlpha = 0.35;
-      renderCurrentHighlight(offscreenContext);
     }
+  }
+}, [currentStackIndex, annotationStack, scale, renderAnnotations]);
 
-    // Render current drawing in real-time
-    if (currentTool === 'draw' && currentPath.length > 1) {
-      renderCurrentDrawing(offscreenContext);
+     // Modified handleRedo to render changes
+  const handleRedo = useCallback(() => {
+    if (currentStackIndex < annotationStack.length - 1) {
+      const newIndex = currentStackIndex + 1;
+      setCurrentStackIndex(newIndex);
+      setAnnotations(annotationStack[newIndex]);
+      
+      // Force re-render of the PDF with updated annotations
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const context = canvas.getContext('2d');
+        if (context) {
+          // Clear the canvas
+          context.clearRect(0, 0, canvas.width, canvas.height);
+          
+          // Re-render the page
+          if (pageRef.current) {
+            const viewport = pageRef.current.getViewport({ scale });
+            const renderContext = {
+              canvasContext: context,
+              viewport: viewport,
+            };
+            
+            renderTaskRef.current = pageRef.current.render(renderContext);
+            renderTaskRef.current.promise.then(() => {
+              // After page renders, draw the annotations
+              renderAnnotations();
+            });
+          }
+        }
+      }
     }
+  }, [currentStackIndex, annotationStack, scale, renderAnnotations]);
+ // Add an effect to re-render annotations when they change
+ useEffect(() => {
+  if (annotations.length >= 0) {
+    renderAnnotations();
+  }
+}, [annotations, renderAnnotations]);
 
-    offscreenContext.restore();
-
-    // Copy the offscreen canvas back to the main canvas
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(offscreenCanvas, 0, 0);
-  }, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
+  
 
   const renderHighlight = (
     context: CanvasRenderingContext2D,
@@ -296,29 +390,29 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     [currentTool]
   );
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas || (currentTool !== 'highlight' && currentTool !== 'draw'))
-      return;
+    // Modified handleMouseMove to update current path without creating stack entries
+    const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas || (currentTool !== 'highlight' && currentTool !== 'draw')) return;
+  
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+  
+      if (currentTool === 'draw' && isDrawing) {
+        setCurrentPath(prev => [...prev, { x, y }]);
+        renderAnnotations(); // Just render the current state
+      }
+  
+      if (currentTool === 'highlight' && highlightInfo) {
+        setHighlightInfo(prev => prev ? { ...prev, current: { x, y } } : null);
+        renderAnnotations();
+      }
+    }, [currentTool, isDrawing, renderAnnotations]);
 
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
 
-    if (currentTool === 'draw' && isDrawing) {
-      setCurrentPath((prev) => [...prev, { x, y }]);
-      renderAnnotations(); // Redraw annotations and current drawing
-    }
-
-    if (currentTool === 'highlight' && highlightInfo) {
-      setHighlightInfo((prev) =>
-        prev ? { ...prev, current: { x, y } } : null
-      );
-      renderAnnotations(); // Redraw annotations and current highlight
-    }
-  };
-
-  const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+   // Modified handleMouseUp to create a single stack entry for the complete drawing
+   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -326,15 +420,25 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    if (currentTool === 'draw' && isDrawing) {
-      const newAnnotation: DrawAnnotation = {
+    if (currentTool === 'draw' && isDrawing && currentPath.length > 0) {
+      const finalPath = [...currentPath, { x, y }];
+      const newAnnotation: DrawingAnnotation = {
         type: 'draw',
         page: pageNum,
-        points: currentPath,
+        points: finalPath,
         color: annotationColor,
         width: 2,
       };
-      setAnnotations((prev) => [...prev, newAnnotation]);
+      
+      // Now we create a single stack entry for the complete drawing
+      setAnnotations(prev => {
+        const updatedAnnotations = [...prev, newAnnotation];
+        const newStack = annotationStack.slice(0, currentStackIndex + 1);
+        setAnnotationStack([...newStack, updatedAnnotations]);
+        setCurrentStackIndex(currentStackIndex + 1);
+        return updatedAnnotations;
+      });
+      
       setIsDrawing(false);
       setCurrentPath([]);
     }
@@ -347,12 +451,14 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
         end: { x, y },
         color: annotationColor,
       };
-      setAnnotations((prev) => [...prev, newAnnotation]);
+      addAnnotation(newAnnotation);
       setHighlightInfo(null);
     }
 
     renderAnnotations();
-  };
+  }, [currentTool, isDrawing, pageNum, currentPath, highlightInfo, annotationColor, currentStackIndex, annotationStack, renderAnnotations, addAnnotation]);
+
+
 
   const handleTextAnnotation = (x: number, y: number) => {
     // Store the position and open the modal
@@ -360,11 +466,14 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     setModalText(''); // Clear previous text
     setIsModalOpen(true);
   };
-  // Utility Functions
-  const clearAllAnnotations = () => {
-    setAnnotations([]);
-    renderPage(pageNum);
-  };
+ // Modified clearAllAnnotations to properly reset history
+ const clearAllAnnotations = useCallback(() => {
+  const emptyState: Annotation[] = [];
+  setAnnotations(emptyState);
+  setAnnotationStack([emptyState]);
+  setCurrentStackIndex(0);
+  renderPage(pageNum);
+}, [pageNum, renderPage]);
 
   const hexToRgb = (hex: any) => {
     // Remove the # if present
@@ -377,20 +486,22 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
 
     return { r, g, b };
   };
-  // Function to handle modal submission
-  const handleModalSubmit = () => {
-    if (modalText && modalPosition) {
-      const newAnnotation: TextAnnotation = {
-        type: 'text',
-        page: pageNum,
-        position: modalPosition,
-        text: modalText,
-        color: annotationColor,
-      };
-      setAnnotations((prev) => [...prev, newAnnotation]);
-      setIsModalOpen(false);
-    }
-  };
+ // Modified handleModalSubmit to work with the new history system
+ const handleModalSubmit = useCallback(() => {
+  if (modalText && modalPosition) {
+    const newAnnotation: TextAnnotation = {
+      type: 'text',
+      page: pageNum,
+      position: modalPosition,
+      text: modalText,
+      color: annotationColor,
+    };
+    addAnnotation(newAnnotation);
+    setIsModalOpen(false);
+    setModalText('');
+    setModalPosition(null);
+  }
+}, [modalText, modalPosition, pageNum, annotationColor, addAnnotation]);
   
   // Function to handle modal cancellation
   const handleModalCancel = () => {
@@ -616,6 +727,34 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
               <Type size={18} />
               Text
             </button>
+            <div className='flex gap-2 mt-4'>
+          <button
+            className={`px-3 py-2 rounded flex items-center gap-2 ${
+              currentStackIndex <= 0 
+                ? 'bg-gray-300 cursor-not-allowed' 
+                : 'bg-blue-500 hover:bg-blue-600'
+            } text-white`}
+            onClick={handleUndo}
+            disabled={currentStackIndex <= 0}
+            title='Undo'
+          >
+            <Undo size={18} />
+            Undo
+          </button>
+          <button
+            className={`px-3 py-2 rounded flex items-center gap-2 ${
+              currentStackIndex >= annotationStack.length - 1 
+                ? 'bg-gray-300 cursor-not-allowed' 
+                : 'bg-blue-500 hover:bg-blue-600'
+            } text-white`}
+            onClick={handleRedo}
+            disabled={currentStackIndex >= annotationStack.length - 1}
+            title='Redo'
+          >
+            <Redo size={18} />
+            Redo
+          </button>
+        </div>
           </div>
 
           {/* Color Picker */}
