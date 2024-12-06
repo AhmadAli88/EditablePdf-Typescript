@@ -3,7 +3,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb } from 'pdf-lib';
-import { Highlighter, Pen, Redo, Type, Undo } from 'lucide-react';
+import {
+  Highlighter,
+  Pen,
+  Redo,
+  Type,
+  Undo,
+  Moon,
+  Sun,
+  Download,
+  Signature,
+} from 'lucide-react';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 // Define types for annotations
@@ -33,7 +43,19 @@ type TextAnnotation = {
   color: string;
 };
 
-type Annotation = HighlightAnnotation | DrawingAnnotation | TextAnnotation;
+type SignatureAnnotation = {
+  type: 'signature';
+  page: number;
+  position: Point;
+  imageData: string;
+  width: number;
+  height: number;
+};
+type Annotation =
+  | HighlightAnnotation
+  | DrawingAnnotation
+  | TextAnnotation
+  | SignatureAnnotation;
 
 interface PDFViewerProps {
   pdfUrl?: string;
@@ -50,10 +72,23 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   pdfUrl = 'https://almsbe.xeventechnologies.com/api/s3/file/multiple_quizzes-(2).pdf',
 }) => {
   // Refs and State Management
+  const [searchText, setSearchText] = useState('');
+  const [searchResults, setSearchResults] = useState<DOMRect[]>([]);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const renderTaskRef = useRef<any>(null);
   const pageRef = useRef<any>(null);
+  // Signature-related states
+  const [signatureImage, setSignatureImage] = useState<string | null>(null);
+  const signatureInputRef = useRef<HTMLInputElement>(null);
+  const [signatureSize, setSignatureSize] = useState<{
+    width: number;
+    height: number;
+  }>({ width: 150, height: 50 });
+
+  // Modify the
+  // New state for theme and signature
+  const [isDarkTheme, setIsDarkTheme] = useState<boolean>(false);
   // PDF-related states
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState<number>(1);
@@ -64,8 +99,9 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   const [currentStackIndex, setCurrentStackIndex] = useState(0);
   // Annotation-related states
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  // Modify the current tool to include signature
   const [currentTool, setCurrentTool] = useState<
-    'select' | 'draw' | 'highlight' | 'text'
+    'select' | 'draw' | 'highlight' | 'text' | 'signature'
   >('highlight');
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
   const [currentPath, setCurrentPath] = useState<Point[]>([]);
@@ -81,7 +117,6 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   const [modalText, setModalText] = useState<string>('');
   const [modalPosition, setModalPosition] = useState<Point | null>(null);
 
-  
   // PDF Loading Effect
   useEffect(() => {
     const loadPDF = async () => {
@@ -99,6 +134,46 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     loadPDF();
   }, [pdfUrl]);
 
+  // Update handleSignatureUpload function
+  const handleSignatureUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const img = new Image();
+        img.onload = () => {
+          // Create a canvas to resize the image while maintaining aspect ratio
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          const maxWidth = 300;
+          const maxHeight = 100;
+          let width = img.width;
+          let height = img.height;
+
+          // Calculate aspect ratio
+          if (width > maxWidth) {
+            height *= maxWidth / width;
+            width = maxWidth;
+          }
+          if (height > maxHeight) {
+            width *= maxHeight / height;
+            height = maxHeight;
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          ctx?.drawImage(img, 0, 0, width, height);
+
+          const resizedImage = canvas.toDataURL('image/png');
+          setSignatureImage(resizedImage);
+          setSignatureSize({ width, height });
+          setCurrentTool('signature');
+        };
+        img.src = event.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    }
+  };
   // Memoized render function
   const renderPage = useCallback(
     async (
@@ -151,120 +226,165 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     [pdfDoc, scale]
   );
 
-// Modified addAnnotation to properly handle drawing history
-const addAnnotation = useCallback((newAnnotation: Annotation) => {
-  setAnnotations(prevAnnotations => {
-    const updatedAnnotations = [...prevAnnotations, newAnnotation];
-    
-    // Create a new stack entry only when drawing is complete
-    if (!isDrawing || newAnnotation.type !== 'draw') {
-      const newStack = annotationStack.slice(0, currentStackIndex + 1);
-      setAnnotationStack([...newStack, updatedAnnotations]);
-      setCurrentStackIndex(currentStackIndex + 1);
-    }
-    
-    return updatedAnnotations;
-  });
-}, [annotationStack, currentStackIndex, isDrawing]);
+  // Modified addAnnotation to properly handle drawing history
+  const addAnnotation = useCallback(
+    (newAnnotation: Annotation) => {
+      setAnnotations((prevAnnotations) => {
+        const updatedAnnotations = [...prevAnnotations, newAnnotation];
 
-// Debounced render annotations function
-const renderAnnotations = useCallback(() => {
-  const canvas = canvasRef.current;
-  if (!canvas) return;
-
-  const context = canvas.getContext('2d');
-  if (!context) return;
-
-  // Create an offscreen canvas for double buffering
-  const offscreenCanvas = document.createElement('canvas');
-  offscreenCanvas.width = canvas.width;
-  offscreenCanvas.height = canvas.height;
-  const offscreenContext = offscreenCanvas.getContext('2d');
-
-  if (!offscreenContext) return;
-
-  // Copy the main canvas content to offscreen canvas
-  offscreenContext.drawImage(canvas, 0, 0);
-
-  // Render existing annotations on the offscreen canvas
-  offscreenContext.save();
-  offscreenContext.globalCompositeOperation = 'multiply';
-
-  const pageAnnotations = annotations.filter((a) => a.page === pageNum);
-
-  pageAnnotations.forEach((annotation) => {
-    switch (annotation.type) {
-      case 'highlight':
-        offscreenContext.globalAlpha = 0.35;
-        renderHighlight(offscreenContext, annotation);
-        break;
-      case 'draw':
-        renderDrawing(offscreenContext, annotation);
-        break;
-      case 'text':
-        renderTextAnnotation(offscreenContext, annotation);
-        break;
-    }
-  });
-
-  // Render current highlight in real-time
-  if (currentTool === 'highlight' && highlightInfo) {
-    offscreenContext.globalAlpha = 0.35;
-    renderCurrentHighlight(offscreenContext);
-  }
-
-  // Render current drawing in real-time
-  if (currentTool === 'draw' && currentPath.length > 1) {
-    renderCurrentDrawing(offscreenContext);
-  }
-
-  offscreenContext.restore();
-
-  // Copy the offscreen canvas back to the main canvas
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(offscreenCanvas, 0, 0);
-}, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
-// Modified handleUndo to render changes
-const handleUndo = useCallback(() => {
-  if (currentStackIndex > 0) {
-    const newIndex = currentStackIndex - 1;
-    setCurrentStackIndex(newIndex);
-    setAnnotations(annotationStack[newIndex]);
-    
-    // Force re-render of the PDF with updated annotations
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const context = canvas.getContext('2d');
-      if (context) {
-        // Clear the canvas
-        context.clearRect(0, 0, canvas.width, canvas.height);
-        
-        // Re-render the page
-        if (pageRef.current) {
-          const viewport = pageRef.current.getViewport({ scale });
-          const renderContext = {
-            canvasContext: context,
-            viewport: viewport,
-          };
-          
-          renderTaskRef.current = pageRef.current.render(renderContext);
-          renderTaskRef.current.promise.then(() => {
-            // After page renders, draw the annotations
-            renderAnnotations();
-          });
+        // Create a new stack entry only when drawing is complete
+        if (!isDrawing || newAnnotation.type !== 'draw') {
+          const newStack = annotationStack.slice(0, currentStackIndex + 1);
+          setAnnotationStack([...newStack, updatedAnnotations]);
+          setCurrentStackIndex(currentStackIndex + 1);
         }
+
+        return updatedAnnotations;
+      });
+    },
+    [annotationStack, currentStackIndex, isDrawing]
+  );
+  // Modify renderAnnotations to include signature rendering
+  const renderAnnotations = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const context = canvas.getContext('2d');
+    if (!context) return;
+
+    // Create an offscreen canvas for double buffering
+    const offscreenCanvas = document.createElement('canvas');
+    offscreenCanvas.width = canvas.width;
+    offscreenCanvas.height = canvas.height;
+    const offscreenContext = offscreenCanvas.getContext('2d');
+
+    if (!offscreenContext) return;
+
+    // Copy the main canvas content to offscreen canvas
+    offscreenContext.drawImage(canvas, 0, 0);
+
+    // Render existing annotations on the offscreen canvas
+    offscreenContext.save();
+
+    const pageAnnotations = annotations.filter((a) => a.page === pageNum);
+
+    pageAnnotations.forEach((annotation) => {
+      switch (annotation.type) {
+        case 'highlight':
+          offscreenContext.globalCompositeOperation = 'multiply';
+          offscreenContext.fillStyle = annotation.color;
+          offscreenContext.globalAlpha = 0.3;
+          renderHighlight(offscreenContext, annotation);
+          offscreenContext.globalCompositeOperation = 'source-over';
+          offscreenContext.globalAlpha = 1;
+          break;
+        case 'draw':
+          renderDrawing(offscreenContext, annotation);
+          break;
+        case 'text':
+          renderTextAnnotation(offscreenContext, annotation);
+          break;
+        case 'signature':
+          renderSignature(offscreenContext, annotation);
+          break;
+      }
+    });
+
+    // Render current highlight in real-time
+    if (currentTool === 'highlight' && highlightInfo) {
+      offscreenContext.globalAlpha = 0.35;
+      renderCurrentHighlight(offscreenContext);
+    }
+
+    // Render current drawing in real-time
+    if (currentTool === 'draw' && currentPath.length > 1) {
+      renderCurrentDrawing(offscreenContext);
+    }
+
+    offscreenContext.restore();
+
+    // Copy the offscreen canvas back to the main canvas
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(offscreenCanvas, 0, 0);
+  }, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
+
+  // Add this search function
+  const handleSearch = useCallback(async () => {
+    if (!searchText || !pdfDoc) return;
+  
+    const page = await pdfDoc.getPage(pageNum);
+    const textContent = await page.getTextContent();
+    const viewport = page.getViewport({ scale });
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+  
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+  
+    // First render the page to clear previous highlights
+    await renderPage(pageNum);
+  
+    let matchCount = 0;
+    for (const item of textContent.items) {
+      const text = item.str || '';
+      let index = text.toLowerCase().indexOf(searchText.toLowerCase());
+      
+      while (index !== -1) {
+        matchCount++;
+        // Calculate position in PDF coordinates
+        const [a, b, c, d, e, f] = item.transform;
+        
+        // Convert to screen coordinates
+        let x = (e + index * (a || 0)) * viewport.scale;
+        let y = (f + index * (b || 0)) * viewport.scale;
+        
+        // Set highlight style
+        ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
+        
+        // Get text metrics
+        ctx.font = `${Math.floor(item.height * viewport.scale)}px sans-serif`;
+        const metrics = ctx.measureText(searchText);
+        
+        // Draw highlight rectangle
+        ctx.fillRect(
+          x,
+          canvas.height - y - (item.height * viewport.scale),
+          metrics.width,
+          item.height * viewport.scale
+        );
+  
+        index = text.toLowerCase().indexOf(searchText.toLowerCase(), index + 1);
       }
     }
-  }
-}, [currentStackIndex, annotationStack, scale, renderAnnotations]);
+  
+    // Re-render annotations on top
+    renderAnnotations();
+    setSearchResults(new Array(matchCount).fill(null));
+  }, [searchText, pdfDoc, pageNum, scale, renderPage, renderAnnotations]);
 
-     // Modified handleRedo to render changes
-  const handleRedo = useCallback(() => {
-    if (currentStackIndex < annotationStack.length - 1) {
-      const newIndex = currentStackIndex + 1;
+  // Add signature rendering function
+  const renderSignature = (
+    context: CanvasRenderingContext2D,
+    annotation: SignatureAnnotation
+  ) => {
+    const img = new Image();
+    img.src = annotation.imageData;
+    context.drawImage(
+      img,
+      annotation.position.x,
+      annotation.position.y,
+      annotation.width,
+      annotation.height
+    );
+  };
+
+  // Modified handleUndo to render changes
+  const handleUndo = useCallback(() => {
+    if (currentStackIndex > 0) {
+      const newIndex = currentStackIndex - 1;
       setCurrentStackIndex(newIndex);
       setAnnotations(annotationStack[newIndex]);
-      
+
       // Force re-render of the PDF with updated annotations
       const canvas = canvasRef.current;
       if (canvas) {
@@ -272,7 +392,7 @@ const handleUndo = useCallback(() => {
         if (context) {
           // Clear the canvas
           context.clearRect(0, 0, canvas.width, canvas.height);
-          
+
           // Re-render the page
           if (pageRef.current) {
             const viewport = pageRef.current.getViewport({ scale });
@@ -280,7 +400,7 @@ const handleUndo = useCallback(() => {
               canvasContext: context,
               viewport: viewport,
             };
-            
+
             renderTaskRef.current = pageRef.current.render(renderContext);
             renderTaskRef.current.promise.then(() => {
               // After page renders, draw the annotations
@@ -291,14 +411,46 @@ const handleUndo = useCallback(() => {
       }
     }
   }, [currentStackIndex, annotationStack, scale, renderAnnotations]);
- // Add an effect to re-render annotations when they change
- useEffect(() => {
-  if (annotations.length >= 0) {
-    renderAnnotations();
-  }
-}, [annotations, renderAnnotations]);
 
-  
+  // Modified handleRedo to render changes
+  const handleRedo = useCallback(() => {
+    if (currentStackIndex < annotationStack.length - 1) {
+      const newIndex = currentStackIndex + 1;
+      setCurrentStackIndex(newIndex);
+      setAnnotations(annotationStack[newIndex]);
+
+      // Force re-render of the PDF with updated annotations
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const context = canvas.getContext('2d');
+        if (context) {
+          // Clear the canvas
+          context.clearRect(0, 0, canvas.width, canvas.height);
+
+          // Re-render the page
+          if (pageRef.current) {
+            const viewport = pageRef.current.getViewport({ scale });
+            const renderContext = {
+              canvasContext: context,
+              viewport: viewport,
+            };
+
+            renderTaskRef.current = pageRef.current.render(renderContext);
+            renderTaskRef.current.promise.then(() => {
+              // After page renders, draw the annotations
+              renderAnnotations();
+            });
+          }
+        }
+      }
+    }
+  }, [currentStackIndex, annotationStack, scale, renderAnnotations]);
+  // Add an effect to re-render annotations when they change
+  useEffect(() => {
+    if (annotations.length >= 0) {
+      renderAnnotations();
+    }
+  }, [annotations, renderAnnotations]);
 
   const renderHighlight = (
     context: CanvasRenderingContext2D,
@@ -355,16 +507,20 @@ const handleUndo = useCallback(() => {
   const renderCurrentHighlight = (context: CanvasRenderingContext2D) => {
     if (!highlightInfo) return;
     const { start, current } = highlightInfo;
+    context.globalCompositeOperation = 'multiply';
     context.fillStyle = annotationColor;
+    context.globalAlpha = 0.3;
     context.fillRect(
       Math.min(start.x, current.x),
       Math.min(start.y, current.y),
       Math.abs(current.x - start.x),
       Math.abs(current.y - start.y)
     );
+    context.globalCompositeOperation = 'source-over';
+    context.globalAlpha = 1;
   };
 
-  // Optimized event handlers
+  // Modify handleMouseDown to handle signature placement
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current;
@@ -385,80 +541,109 @@ const handleUndo = useCallback(() => {
         case 'text':
           handleTextAnnotation(x, y);
           break;
+        case 'signature':
+          if (signatureImage) {
+            const newAnnotation: SignatureAnnotation = {
+              type: 'signature',
+              page: pageNum,
+              position: { x, y },
+              imageData: signatureImage,
+              width: signatureSize.width,
+              height: signatureSize.height,
+            };
+            addAnnotation(newAnnotation);
+          }
+          break;
       }
     },
-    [currentTool]
+    [currentTool, signatureImage, pageNum, addAnnotation, signatureSize]
   );
-
-    // Modified handleMouseMove to update current path without creating stack entries
-    const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+  // Modified handleMouseMove to update current path without creating stack entries
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current;
-      if (!canvas || (currentTool !== 'highlight' && currentTool !== 'draw')) return;
-  
+      if (!canvas || (currentTool !== 'highlight' && currentTool !== 'draw'))
+        return;
+
       const rect = canvas.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
-  
+
       if (currentTool === 'draw' && isDrawing) {
-        setCurrentPath(prev => [...prev, { x, y }]);
+        setCurrentPath((prev) => [...prev, { x, y }]);
         renderAnnotations(); // Just render the current state
       }
-  
+
       if (currentTool === 'highlight' && highlightInfo) {
-        setHighlightInfo(prev => prev ? { ...prev, current: { x, y } } : null);
+        setHighlightInfo((prev) =>
+          prev ? { ...prev, current: { x, y } } : null
+        );
         renderAnnotations();
       }
-    }, [currentTool, isDrawing, renderAnnotations]);
+    },
+    [currentTool, isDrawing, renderAnnotations]
+  );
 
+  // Modified handleMouseUp to create a single stack entry for the complete drawing
+  const handleMouseUp = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
 
-   // Modified handleMouseUp to create a single stack entry for the complete drawing
-   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
 
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+      if (currentTool === 'draw' && isDrawing && currentPath.length > 0) {
+        const finalPath = [...currentPath, { x, y }];
+        const newAnnotation: DrawingAnnotation = {
+          type: 'draw',
+          page: pageNum,
+          points: finalPath,
+          color: annotationColor,
+          width: 2,
+        };
 
-    if (currentTool === 'draw' && isDrawing && currentPath.length > 0) {
-      const finalPath = [...currentPath, { x, y }];
-      const newAnnotation: DrawingAnnotation = {
-        type: 'draw',
-        page: pageNum,
-        points: finalPath,
-        color: annotationColor,
-        width: 2,
-      };
-      
-      // Now we create a single stack entry for the complete drawing
-      setAnnotations(prev => {
-        const updatedAnnotations = [...prev, newAnnotation];
-        const newStack = annotationStack.slice(0, currentStackIndex + 1);
-        setAnnotationStack([...newStack, updatedAnnotations]);
-        setCurrentStackIndex(currentStackIndex + 1);
-        return updatedAnnotations;
-      });
-      
-      setIsDrawing(false);
-      setCurrentPath([]);
-    }
+        // Now we create a single stack entry for the complete drawing
+        setAnnotations((prev) => {
+          const updatedAnnotations = [...prev, newAnnotation];
+          const newStack = annotationStack.slice(0, currentStackIndex + 1);
+          setAnnotationStack([...newStack, updatedAnnotations]);
+          setCurrentStackIndex(currentStackIndex + 1);
+          return updatedAnnotations;
+        });
 
-    if (currentTool === 'highlight' && highlightInfo) {
-      const newAnnotation: HighlightAnnotation = {
-        type: 'highlight',
-        page: pageNum,
-        start: highlightInfo.start,
-        end: { x, y },
-        color: annotationColor,
-      };
-      addAnnotation(newAnnotation);
-      setHighlightInfo(null);
-    }
+        setIsDrawing(false);
+        setCurrentPath([]);
+      }
 
-    renderAnnotations();
-  }, [currentTool, isDrawing, pageNum, currentPath, highlightInfo, annotationColor, currentStackIndex, annotationStack, renderAnnotations, addAnnotation]);
+      if (currentTool === 'highlight' && highlightInfo) {
+        const newAnnotation: HighlightAnnotation = {
+          type: 'highlight',
+          page: pageNum,
+          start: highlightInfo.start,
+          end: { x, y },
+          color: annotationColor,
+        };
+        addAnnotation(newAnnotation);
+        setHighlightInfo(null);
+      }
 
-
+      renderAnnotations();
+    },
+    [
+      currentTool,
+      isDrawing,
+      pageNum,
+      currentPath,
+      highlightInfo,
+      annotationColor,
+      currentStackIndex,
+      annotationStack,
+      renderAnnotations,
+      addAnnotation,
+    ]
+  );
 
   const handleTextAnnotation = (x: number, y: number) => {
     // Store the position and open the modal
@@ -466,14 +651,14 @@ const handleUndo = useCallback(() => {
     setModalText(''); // Clear previous text
     setIsModalOpen(true);
   };
- // Modified clearAllAnnotations to properly reset history
- const clearAllAnnotations = useCallback(() => {
-  const emptyState: Annotation[] = [];
-  setAnnotations(emptyState);
-  setAnnotationStack([emptyState]);
-  setCurrentStackIndex(0);
-  renderPage(pageNum);
-}, [pageNum, renderPage]);
+  // Modified clearAllAnnotations to properly reset history
+  const clearAllAnnotations = useCallback(() => {
+    const emptyState: Annotation[] = [];
+    setAnnotations(emptyState);
+    setAnnotationStack([emptyState]);
+    setCurrentStackIndex(0);
+    renderPage(pageNum);
+  }, [pageNum, renderPage]);
 
   const hexToRgb = (hex: any) => {
     // Remove the # if present
@@ -486,27 +671,28 @@ const handleUndo = useCallback(() => {
 
     return { r, g, b };
   };
- // Modified handleModalSubmit to work with the new history system
- const handleModalSubmit = useCallback(() => {
-  if (modalText && modalPosition) {
-    const newAnnotation: TextAnnotation = {
-      type: 'text',
-      page: pageNum,
-      position: modalPosition,
-      text: modalText,
-      color: annotationColor,
-    };
-    addAnnotation(newAnnotation);
-    setIsModalOpen(false);
-    setModalText('');
-    setModalPosition(null);
-  }
-}, [modalText, modalPosition, pageNum, annotationColor, addAnnotation]);
-  
+  // Modified handleModalSubmit to work with the new history system
+  const handleModalSubmit = useCallback(() => {
+    if (modalText && modalPosition) {
+      const newAnnotation: TextAnnotation = {
+        type: 'text',
+        page: pageNum,
+        position: modalPosition,
+        text: modalText,
+        color: annotationColor,
+      };
+      addAnnotation(newAnnotation);
+      setIsModalOpen(false);
+      setModalText('');
+      setModalPosition(null);
+    }
+  }, [modalText, modalPosition, pageNum, annotationColor, addAnnotation]);
+
   // Function to handle modal cancellation
   const handleModalCancel = () => {
     setIsModalOpen(false);
   };
+  // Modify downloadAnnotatedPDF to handle signature
   const downloadAnnotatedPDF = async () => {
     try {
       // Fetch the original PDF
@@ -534,73 +720,80 @@ const handleUndo = useCallback(() => {
       });
 
       // Add annotations to the page
-      annotations
-        .filter((annotation) => annotation.page === pageNum)
-        .forEach((annotation) => {
-          switch (annotation.type) {
-            case 'highlight': {
-              // Convert the user selected color to RGB
-              const color = hexToRgb(annotation.color);
+      for (const annotation of annotations.filter((a) => a.page === pageNum)) {
+        switch (annotation.type) {
+          case 'highlight': {
+            const color = hexToRgb(annotation.color);
+            const start = transformCoordinate(
+              annotation.start.x,
+              annotation.start.y
+            );
+            const end = transformCoordinate(annotation.end.x, annotation.end.y);
 
-              // Transform start and end coordinates
-              const start = transformCoordinate(
-                annotation.start.x,
-                annotation.start.y
-              );
-              const end = transformCoordinate(
-                annotation.end.x,
-                annotation.end.y
-              );
-
-              page.drawRectangle({
-                x: Math.min(start.x, end.x),
-                y: Math.min(start.y, end.y),
-                width: Math.abs(end.x - start.x),
-                height: Math.abs(end.y - start.y),
-                color: rgb(color.r, color.g, color.b),
-                opacity: 0.35,
-              });
-              break;
-            }
-            case 'text': {
-              // Convert the user selected color to RGB
-              const color = hexToRgb(annotation.color);
-              const transformedPos = transformCoordinate(
-                annotation.position.x,
-                annotation.position.y
-              );
-
-              page.drawText(annotation.text, {
-                x: transformedPos.x,
-                y: transformedPos.y,
-                size: 16,
-                color: rgb(color.r, color.g, color.b),
-              });
-              break;
-            }
-            case 'draw': {
-              // Convert the user selected color to RGB
-              const color = hexToRgb(annotation.color);
-
-              // Transform points
-              const scaledPoints = annotation.points.map((point) =>
-                transformCoordinate(point.x, point.y)
-              );
-
-              for (let i = 1; i < scaledPoints.length; i++) {
-                const prev = scaledPoints[i - 1];
-                const curr = scaledPoints[i];
-                page.drawLine({
-                  start: prev,
-                  end: curr,
-                  thickness: annotation.width,
-                  color: rgb(color.r, color.g, color.b),
-                });
-              }
-              break;
-            }
+            page.drawRectangle({
+              x: Math.min(start.x, end.x),
+              y: Math.min(start.y, end.y),
+              width: Math.abs(end.x - start.x),
+              height: Math.abs(end.y - start.y),
+              color: rgb(color.r, color.g, color.b),
+              opacity: 0.35,
+            });
+            break;
           }
-        });
+          case 'text': {
+            const color = hexToRgb(annotation.color);
+            const transformedPos = transformCoordinate(
+              annotation.position.x,
+              annotation.position.y
+            );
+
+            page.drawText(annotation.text, {
+              x: transformedPos.x,
+              y: transformedPos.y,
+              size: 16,
+              color: rgb(color.r, color.g, color.b),
+            });
+            break;
+          }
+          case 'draw': {
+            const color = hexToRgb(annotation.color);
+            const scaledPoints = annotation.points.map((point) =>
+              transformCoordinate(point.x, point.y)
+            );
+
+            for (let i = 1; i < scaledPoints.length; i++) {
+              const prev = scaledPoints[i - 1];
+              const curr = scaledPoints[i];
+              page.drawLine({
+                start: prev,
+                end: curr,
+                thickness: annotation.width,
+                color: rgb(color.r, color.g, color.b),
+              });
+            }
+            break;
+          }
+          case 'signature': {
+            const transformedPos = transformCoordinate(
+              annotation.position.x,
+              annotation.position.y
+            );
+
+            // Embed the signature image
+            const signatureImg = await pdfDoc.embedPng(
+              await fetch(annotation.imageData).then((r) => r.arrayBuffer())
+            );
+
+            page.drawImage(signatureImg, {
+              x: transformedPos.x,
+              y: transformedPos.y,
+              width: annotation.width * scaleX,
+              height: annotation.height * scaleY,
+            });
+            break;
+          }
+        }
+      }
 
       const pdfBytes = await pdfDoc.save();
 
@@ -627,36 +820,71 @@ const handleUndo = useCallback(() => {
       }
     };
   }, []);
+
+  // New function to download canvas as image
+  const downloadCanvasAsImage = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // Create a temporary link to trigger download
+    const link = document.createElement('a');
+    link.download = `pdf-page-${pageNum}-annotated.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  };
   return (
-    <div className='w-full max-w-6xl mx-auto p-4'>
-      {/* Error Display */}
-      {isModalOpen && (
-  <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50">
-    <div className="bg-white rounded-lg p-6 shadow-lg w-96">
-      <h2 className="text-lg font-semibold mb-4">Add Text Annotation</h2>
-      <textarea
-        className="w-full border border-gray-300 rounded-lg p-2 h-20"
-        value={modalText}
-        onChange={(e) => setModalText(e.target.value)}
-        placeholder="Enter annotation text here..."
-      />
-      <div className="flex justify-end mt-4 gap-2">
+    <div
+      className={`w-full mx-auto p-4 transition-colors duration-300 ${
+        isDarkTheme ? 'bg-gray-900 text-white' : 'bg-white text-black'
+      }`}
+    >
+      <div className='absolute top-4 right-4'>
         <button
-          className="px-4 py-2 bg-gray-300 text-black rounded hover:bg-gray-400"
-          onClick={handleModalCancel}
+          onClick={() => setIsDarkTheme(!isDarkTheme)}
+          className={`p-2 rounded-full ${
+            isDarkTheme
+              ? 'bg-gray-700 text-yellow-400'
+              : 'bg-gray-200 text-gray-800'
+          }`}
         >
-          Cancel
-        </button>
-        <button
-          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          onClick={handleModalSubmit}
-        >
-          Add
+          {isDarkTheme ? <Sun size={24} /> : <Moon size={24} />}
         </button>
       </div>
-    </div>
-  </div>
-)}
+      <input
+        type='file'
+        ref={signatureInputRef}
+        accept='image/*'
+        onChange={handleSignatureUpload}
+        className='hidden'
+      />
+      {/* Error Display */}
+      {isModalOpen && (
+        <div className='fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-50'>
+          <div className='bg-white rounded-lg p-6 shadow-lg w-96'>
+            <h2 className='text-lg font-semibold mb-4'>Add Text Annotation</h2>
+            <textarea
+              className='w-full border border-gray-300 rounded-lg p-2 h-20'
+              value={modalText}
+              onChange={(e) => setModalText(e.target.value)}
+              placeholder='Enter annotation text here...'
+            />
+            <div className='flex justify-end mt-4 gap-2'>
+              <button
+                className='px-4 py-2 bg-gray-300 text-black rounded hover:bg-gray-400'
+                onClick={handleModalCancel}
+              >
+                Cancel
+              </button>
+              <button
+                className='px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600'
+                onClick={handleModalSubmit}
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className='bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4'>
@@ -665,9 +893,21 @@ const handleUndo = useCallback(() => {
       )}
 
       {/* Flexbox Container */}
-      <div className='flex gap-4 custom-height overflow-hidden'>
+      <div
+        className={`flex gap-4 custom-height overflow-hidden ${
+          isDarkTheme
+            ? 'bg-gray-800 border-gray-700'
+            : 'bg-white border-gray-300'
+        }`}
+      >
         {/* PDF Viewer */}
-        <div className='flex-grow relative border border-gray-300 rounded custom-boxShadow'>
+        <div
+          className={`flex-grow relative border rounded custom-boxShadow ${
+            isDarkTheme
+              ? 'border-gray-700 bg-gray-800'
+              : 'border-gray-300 bg-white'
+          }`}
+        >
           <canvas
             ref={canvasRef}
             onMouseDown={handleMouseDown}
@@ -675,19 +915,34 @@ const handleUndo = useCallback(() => {
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
             className={`cursor-${
-              currentTool === 'highlight'
-                ? 'crosshair'
-                : currentTool === 'draw'
+              currentTool === 'highlight' ||
+              currentTool === 'draw' ||
+              currentTool === 'signature'
                 ? 'crosshair'
                 : currentTool === 'text'
                 ? 'text'
                 : 'default'
             }`}
+            // className={`cursor-${
+            //   currentTool === 'highlight'
+            //     ? 'crosshair'
+            //     : currentTool === 'draw'
+            //     ? 'crosshair'
+            //     : currentTool === 'text'
+            //     ? 'text'
+            //     : 'default'
+            // }`}
           />
         </div>
 
         {/* Toolbar */}
-        <div className='flex-shrink-0 p-4 bg-gray-100 border border-gray-300 rounded custom-boxShadow'>
+        <div
+          className={`flex-shrink-0 p-4 border rounded custom-boxShadow ${
+            isDarkTheme
+              ? 'bg-gray-700 border-gray-600 text-white'
+              : 'bg-gray-100 border-gray-300'
+          }`}
+        >
           <h3 className='text-lg font-bold mb-4'>Tools</h3>
 
           {/* Tool Selection Buttons */}
@@ -727,35 +982,100 @@ const handleUndo = useCallback(() => {
               <Type size={18} />
               Text
             </button>
-            <div className='flex gap-2 mt-4'>
-          <button
-            className={`px-3 py-2 rounded flex items-center gap-2 ${
-              currentStackIndex <= 0 
-                ? 'bg-gray-300 cursor-not-allowed' 
-                : 'bg-blue-500 hover:bg-blue-600'
-            } text-white`}
-            onClick={handleUndo}
-            disabled={currentStackIndex <= 0}
-            title='Undo'
-          >
-            <Undo size={18} />
-            Undo
-          </button>
-          <button
-            className={`px-3 py-2 rounded flex items-center gap-2 ${
-              currentStackIndex >= annotationStack.length - 1 
-                ? 'bg-gray-300 cursor-not-allowed' 
-                : 'bg-blue-500 hover:bg-blue-600'
-            } text-white`}
-            onClick={handleRedo}
-            disabled={currentStackIndex >= annotationStack.length - 1}
-            title='Redo'
-          >
-            <Redo size={18} />
-            Redo
-          </button>
-        </div>
+            <div className='flex gap-2 mt-4 flex-wrap'>
+              <button
+                className={`px-3 py-2 rounded flex items-center gap-2 ${
+                  currentStackIndex <= 0
+                    ? 'bg-gray-300 cursor-not-allowed'
+                    : 'bg-blue-500 hover:bg-blue-600'
+                } text-white`}
+                onClick={handleUndo}
+                disabled={currentStackIndex <= 0}
+                title='Undo'
+              >
+                <Undo size={18} />
+                Undo
+              </button>
+              <button
+                className={`px-3 py-2 rounded flex items-center gap-2 ${
+                  currentStackIndex >= annotationStack.length - 1
+                    ? 'bg-gray-300 cursor-not-allowed'
+                    : 'bg-blue-500 hover:bg-blue-600'
+                } text-white`}
+                onClick={handleRedo}
+                disabled={currentStackIndex >= annotationStack.length - 1}
+                title='Redo'
+              >
+                <Redo size={18} />
+                Redo
+              </button>
+              <button
+                key='signature'
+                className={`px-3 py-2 rounded flex items-center gap-2 ${
+                  currentTool === 'signature'
+                    ? 'bg-indigo-700'
+                    : 'bg-indigo-500'
+                } text-white hover:bg-indigo-600`}
+                onClick={() => {
+                  // If no signature, trigger file upload
+                  if (!signatureImage) {
+                    signatureInputRef.current?.click();
+                  } else {
+                    setCurrentTool('signature');
+                  }
+                }}
+                title='Add Signature'
+              >
+                <Signature size={18} />
+                Signature
+              </button>
+            </div>
           </div>
+          <div className='mb-4'>
+            <h4 className='text-lg font-bold mb-2'>Search</h4>
+            <div className='flex gap-2'>
+              <input
+                type='text'
+                placeholder='Search text...'
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                className='flex-1 p-2 border rounded text-black'
+              />
+              <button
+                className='px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600'
+                onClick={handleSearch}
+                disabled={!searchText}
+              >
+                Search
+              </button>
+            </div>
+            {searchResults.length > 0 && (
+              <p className='text-sm mt-2'>
+                Found {searchResults.length} matches
+              </p>
+            )}
+          </div>
+          {signatureImage && (
+            <div className='mt-4'>
+              <p className='text-sm mb-2'>Signature Preview:</p>
+              <div className='flex items-center gap-2'>
+                <img
+                  src={signatureImage}
+                  alt='Signature'
+                  className='max-w-full h-auto rounded border'
+                />
+                <button
+                  className='px-2 py-1 bg-red-500 text-white rounded hover:bg-red-600'
+                  onClick={() => {
+                    setSignatureImage(null);
+                    setCurrentTool('highlight');
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Color Picker */}
           <div className='mb-4'>
@@ -782,12 +1102,24 @@ const handleUndo = useCallback(() => {
             >
               Download PDF
             </button>
+
+            <button
+              className='px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600'
+              onClick={downloadCanvasAsImage}
+            >
+              <Download size={18} className='mr-2 inline' />
+              Download Image
+            </button>
           </div>
         </div>
       </div>
 
       {/* Page Navigation */}
-      <div className='mt-4 flex justify-center items-center gap-4'>
+      <div
+        className={`mt-4 flex justify-center items-center gap-4 ${
+          isDarkTheme ? 'text-white' : 'text-black'
+        }`}
+      >
         <button
           className='px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600'
           onClick={() => {
