@@ -13,7 +13,12 @@ import {
   Sun,
   Download,
   Signature,
+  FileSpreadsheet,
+  Sheet,
+  FileText,
 } from 'lucide-react';
+import { saveAs } from 'file-saver';
+import pptxgen from 'pptxgenjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 // Define types for annotations
@@ -84,6 +89,7 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
   pdfUrl = 'https://almsbe.xeventechnologies.com/api/s3/file/multiple_quizzes-(2).pdf',
 }) => {
   // Refs and State Management
+  const [replaceText, setReplaceText] = useState('');
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const renderTaskRef = useRef<any>(null);
@@ -147,6 +153,83 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     };
     loadPDF();
   }, [pdfUrl]);
+
+  // Replace the downloadAsPPT function with this:
+  const downloadAsPPT = async () => {
+    try {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      // Create a new PowerPoint presentation
+      const pptx = new pptxgen();
+
+      // Add a new slide
+      const slide = pptx.addSlide();
+
+      // Get the canvas image as base64
+      const imageData = canvas.toDataURL('image/png').split(',')[1];
+
+      // Add the image to the slide
+      slide.addImage({
+        data: `data:image/png;base64,${imageData}`,
+        x: 0,
+        y: 0,
+        w: '100%',
+        h: '100%',
+      });
+
+      // Save the presentation
+      await pptx.writeFile(`pdf-page-${pageNum}-presentation.pptx`);
+    } catch (error) {
+      console.error('Error downloading as PPT:', error);
+    }
+  };
+
+  const downloadAsWord = async () => {
+    try {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      // Create a Word-like HTML structure
+      const wordContent = `
+      <html>
+        <body>
+          <div style="text-align: center;">
+            <img src="${canvas.toDataURL(
+              'image/png'
+            )}" style="max-width: 100%;" />
+          </div>
+        </body>
+      </html>
+    `;
+
+      // Convert to Blob
+      const blob = new Blob([wordContent], { type: 'application/msword' });
+      saveAs(blob, `pdf-page-${pageNum}-document.doc`);
+    } catch (error) {
+      console.error('Error downloading as Word:', error);
+    }
+  };
+
+  const downloadAsExcel = async () => {
+    try {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      // Create a simple Excel-like CSV structure
+      const excelContent = `PDF Page ${pageNum}\nImage embedded as base64\n${canvas.toDataURL(
+        'image/png'
+      )}`;
+
+      // Convert to Blob
+      const blob = new Blob([excelContent], {
+        type: 'application/vnd.ms-excel',
+      });
+      saveAs(blob, `pdf-page-${pageNum}-spreadsheet.xls`);
+    } catch (error) {
+      console.error('Error downloading as Excel:', error);
+    }
+  };
 
   // Update handleSignatureUpload function
   const handleSignatureUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -322,9 +405,7 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     context.drawImage(offscreenCanvas, 0, 0);
   }, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
 
-
-
-  const handleSearch = useCallback(async () => {
+  const handleSearch = useCallback(async (shouldReplace: boolean = false) => {
     if (!searchText || !pdfDoc) return;
   
     const page = await pdfDoc.getPage(pageNum);
@@ -336,53 +417,115 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
   
-    // First render the page to clear previous highlights
     await renderPage(pageNum);
   
     let matchCount = 0;
+    const items = [...textContent.items];
   
-    for (const item of textContent.items) {
+    // Sort items by vertical position (top to bottom)
+    items.sort((a, b) => b.transform[5] - a.transform[5]);
+  
+    for (const item of items) {
       const text = item.str || '';
-      let startIndex = 0;
-      let index;
-  
-      // Use word boundaries to find exact matches
       const regex = new RegExp(`\\b${searchText}\\b`, 'gi');
-      while ((index = regex.exec(text)?.index) !== undefined) {
+      let match;
+  
+      while ((match = regex.exec(text)) !== null) {
         matchCount++;
-        
-        // Calculate exact position of the word
+        const index = match.index;
         const transform = item.transform;
         const fontHeight = Math.abs(transform[3] || 12);
-        
-        // Get the width of text before the match for precise x-position
-        const preText = text.substring(0, index);
-        ctx.font = `${fontHeight * viewport.scale}px sans-serif`;
-        const preWidth = ctx.measureText(preText).width;
-        
-        // Calculate dimensions for highlight
-        const matchWidth = ctx.measureText(searchText).width;
-        const x = (transform[4] * viewport.scale) + (preWidth * (transform[0] / fontHeight));
-        const y = canvas.height - (transform[5] * viewport.scale);
-        
-        // Draw highlight with adjusted dimensions
-        ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
-        ctx.fillRect(
-          x,
-          y - (fontHeight * viewport.scale),
-          matchWidth,
-          fontHeight * viewport.scale
-        );
+        const scaledFontHeight = fontHeight * viewport.scale;
   
-        startIndex = index + 1;
-        regex.lastIndex = startIndex;
+        ctx.font = `${scaledFontHeight}px sans-serif`;
+  
+        // Calculate positions and dimensions
+        const lineStart = transform[4] * viewport.scale;
+        const lineWidth = canvas.width - lineStart - 20; // Leave some margin
+        const preText = text.substring(0, index);
+        const preWidth = ctx.measureText(preText).width;
+        const searchWidth = ctx.measureText(searchText).width;
+  
+        if (shouldReplace) {
+          // Clear the area of original text
+          ctx.fillStyle = 'white';
+          ctx.fillRect(
+            lineStart + preWidth,
+            canvas.height - (transform[5] * viewport.scale) - scaledFontHeight - 5,
+            searchWidth,
+            scaledFontHeight + 10
+          );
+  
+          // Handle text wrapping for replacement text
+          const words = replaceText.split(' ');
+          let currentLine = '';
+          let currentX = lineStart + preWidth;
+          let currentY = canvas.height - (transform[5] * viewport.scale);
+          let maxY = currentY;
+  
+          // Clear a larger area for potential wrapped text
+          ctx.fillStyle = 'white';
+          const potentialHeight = scaledFontHeight * Math.ceil(replaceText.length / 30); // Estimate
+          ctx.fillRect(
+            currentX - 2,
+            currentY - scaledFontHeight - 5,
+            lineWidth + 4,
+            potentialHeight + 10
+          );
+  
+          ctx.fillStyle = 'black';
+          
+          // Draw text with wrapping
+          for (const word of words) {
+            const testLine = currentLine + (currentLine ? ' ' : '') + word;
+            const metrics = ctx.measureText(testLine);
+  
+            if (currentX + metrics.width > lineStart + lineWidth) {
+              // Draw current line and move to next
+              ctx.fillText(currentLine, currentX, currentY - (scaledFontHeight * 0.2));
+              currentLine = word;
+              currentX = lineStart + preWidth;
+              currentY += scaledFontHeight * 1.2;
+              maxY = Math.max(maxY, currentY);
+            } else {
+              currentLine = testLine;
+            }
+          }
+  
+          // Draw remaining text
+          if (currentLine) {
+            ctx.fillText(currentLine, currentX, currentY - (scaledFontHeight * 0.2));
+          }
+  
+          // Handle remaining text after replacement
+          const remainingText = text.substring(index + searchText.length);
+          if (remainingText) {
+            const nextX = currentX + ctx.measureText(currentLine).width + 5;
+            ctx.fillText(remainingText, nextX, currentY - (scaledFontHeight * 0.2));
+          }
+  
+        } else {
+          // Highlight for search
+          ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
+          ctx.fillRect(
+            lineStart + preWidth,
+            canvas.height - (transform[5] * viewport.scale) - scaledFontHeight,
+            searchWidth,
+            scaledFontHeight
+          );
+        }
       }
     }
   
-    // Re-render annotations on top
     renderAnnotations();
     setSearchResults(new Array(matchCount).fill(null));
-  }, [searchText, pdfDoc, pageNum, scale, renderPage, renderAnnotations]);
+  }, [searchText, replaceText, pdfDoc, pageNum, scale, renderPage, renderAnnotations]);
+
+  // Add this new function to handle replace
+  const handleReplace = useCallback(() => {
+    if (!searchText || !replaceText) return;
+    handleSearch(true);
+  }, [searchText, replaceText, handleSearch]);
 
   // Add signature rendering function
   const renderSignature = (
@@ -402,6 +545,7 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
 
   // Modified handleUndo to render changes
   const handleUndo = useCallback(() => {
+    debugger;
     if (currentStackIndex > 0) {
       const newIndex = currentStackIndex - 1;
       setCurrentStackIndex(newIndex);
@@ -1075,28 +1219,46 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
           )}
 
           <div className='mb-4'>
-            <h4 className='text-lg font-bold mb-2'>Search</h4>
-            <div className='flex gap-2'>
-              <input
-                type='text'
-                placeholder='Search text...'
-                value={searchText}
-                onChange={(e) => setSearchText(e.target.value)}
-                className='flex-1 p-2 border rounded text-black'
-              />
-              <button
-                className='px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600'
-                onClick={handleSearch}
-                disabled={!searchText}
-              >
-                Search
-              </button>
+            <h4 className='text-lg font-bold mb-2'>Search & Replace</h4>
+            <div className='space-y-2'>
+              <div className='flex gap-2'>
+                <input
+                  type='text'
+                  placeholder='Search text...'
+                  value={searchText}
+                  onChange={(e) => setSearchText(e.target.value)}
+                  className='flex-1 p-2 border rounded text-black'
+                />
+                <button
+                  className='px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600'
+                  onClick={() => handleSearch(false)}
+                  disabled={!searchText}
+                >
+                  Search
+                </button>
+              </div>
+              <div className='flex gap-2'>
+                <input
+                  type='text'
+                  placeholder='Replace with...'
+                  value={replaceText}
+                  onChange={(e) => setReplaceText(e.target.value)}
+                  className='flex-1 p-2 border rounded text-black'
+                />
+                <button
+                  className='px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600'
+                  onClick={handleReplace}
+                  disabled={!searchText || !replaceText}
+                >
+                  Replace All
+                </button>
+              </div>
+              {searchResults.length > 0 && (
+                <p className='text-sm mt-2'>
+                  Found {searchResults.length} matches
+                </p>
+              )}
             </div>
-            {searchResults.length > 0 && (
-              <p className='text-sm mt-2'>
-                Found {searchResults.length} matches
-              </p>
-            )}
           </div>
           {/* Color Picker */}
           <div className='mb-4'>
@@ -1129,6 +1291,30 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
             >
               <Download size={18} className='mr-2 inline' />
               Download Image
+            </button>
+
+            <button
+              className='px-4 py-2 bg-orange-500 text-white rounded hover:bg-orange-600 flex items-center justify-center'
+              onClick={downloadAsPPT}
+            >
+              <Sheet size={18} className='mr-2' />
+              Download as PPT
+            </button>
+
+            <button
+              className='px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center justify-center'
+              onClick={downloadAsWord}
+            >
+              <FileText size={18} className='mr-2' />
+              Download as Word
+            </button>
+
+            <button
+              className='px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 flex items-center justify-center'
+              onClick={downloadAsExcel}
+            >
+              <FileSpreadsheet size={18} className='mr-2' />
+              Download as Excel
             </button>
           </div>
         </div>
