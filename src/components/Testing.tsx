@@ -67,18 +67,32 @@ interface DrawAnnotation {
   color: string;
   width: number;
 }
+interface TextItem {
+  str: string;
+  dir: string;
+  transform: number[];
+  width: number;
+  height: number;
+  fontName: string;
+}
 
+interface TextContent {
+  items: TextItem[];
+  styles: Record<string, unknown>;
+}
 const PDFViewer: React.FC<PDFViewerProps> = ({
   pdfUrl = 'https://almsbe.xeventechnologies.com/api/s3/file/multiple_quizzes-(2).pdf',
 }) => {
   // Refs and State Management
-  const [searchText, setSearchText] = useState('');
-  const [searchResults, setSearchResults] = useState<DOMRect[]>([]);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const renderTaskRef = useRef<any>(null);
   const pageRef = useRef<any>(null);
   // Signature-related states
+  const [searchText, setSearchText] = useState('');
+  const [searchResults, setSearchResults] = useState<
+    { pageNum: number; matches: DOMRect[] }[]
+  >([]);
   const [signatureImage, setSignatureImage] = useState<string | null>(null);
   const signatureInputRef = useRef<HTMLInputElement>(null);
   const [signatureSize, setSignatureSize] = useState<{
@@ -308,12 +322,13 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     context.drawImage(offscreenCanvas, 0, 0);
   }, [annotations, pageNum, currentTool, currentPath, highlightInfo]);
 
-  // Add this search function
+
+
   const handleSearch = useCallback(async () => {
     if (!searchText || !pdfDoc) return;
   
     const page = await pdfDoc.getPage(pageNum);
-    const textContent = await page.getTextContent();
+    const textContent = await page.getTextContent() as TextContent;
     const viewport = page.getViewport({ scale });
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -325,35 +340,42 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
     await renderPage(pageNum);
   
     let matchCount = 0;
+  
     for (const item of textContent.items) {
       const text = item.str || '';
-      let index = text.toLowerCase().indexOf(searchText.toLowerCase());
-      
-      while (index !== -1) {
+      let startIndex = 0;
+      let index;
+  
+      // Use word boundaries to find exact matches
+      const regex = new RegExp(`\\b${searchText}\\b`, 'gi');
+      while ((index = regex.exec(text)?.index) !== undefined) {
         matchCount++;
-        // Calculate position in PDF coordinates
-        const [a, b, c, d, e, f] = item.transform;
         
-        // Convert to screen coordinates
-        let x = (e + index * (a || 0)) * viewport.scale;
-        let y = (f + index * (b || 0)) * viewport.scale;
+        // Calculate exact position of the word
+        const transform = item.transform;
+        const fontHeight = Math.abs(transform[3] || 12);
         
-        // Set highlight style
+        // Get the width of text before the match for precise x-position
+        const preText = text.substring(0, index);
+        ctx.font = `${fontHeight * viewport.scale}px sans-serif`;
+        const preWidth = ctx.measureText(preText).width;
+        
+        // Calculate dimensions for highlight
+        const matchWidth = ctx.measureText(searchText).width;
+        const x = (transform[4] * viewport.scale) + (preWidth * (transform[0] / fontHeight));
+        const y = canvas.height - (transform[5] * viewport.scale);
+        
+        // Draw highlight with adjusted dimensions
         ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
-        
-        // Get text metrics
-        ctx.font = `${Math.floor(item.height * viewport.scale)}px sans-serif`;
-        const metrics = ctx.measureText(searchText);
-        
-        // Draw highlight rectangle
         ctx.fillRect(
           x,
-          canvas.height - y - (item.height * viewport.scale),
-          metrics.width,
-          item.height * viewport.scale
+          y - (fontHeight * viewport.scale),
+          matchWidth,
+          fontHeight * viewport.scale
         );
   
-        index = text.toLowerCase().indexOf(searchText.toLowerCase(), index + 1);
+        startIndex = index + 1;
+        regex.lastIndex = startIndex;
       }
     }
   
@@ -944,7 +966,6 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
           }`}
         >
           <h3 className='text-lg font-bold mb-4'>Tools</h3>
-
           {/* Tool Selection Buttons */}
           <div className='mb-4 flex flex-col gap-2'>
             <button
@@ -1031,6 +1052,28 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
               </button>
             </div>
           </div>
+          {signatureImage && (
+            <div className='mt-4'>
+              <p className='text-sm mb-2'>Signature Preview:</p>
+              <div className='flex items-center gap-2'>
+                <img
+                  src={signatureImage}
+                  alt='Signature'
+                  className='max-w-full h-auto rounded border'
+                />
+                <button
+                  className='px-2 py-1 bg-red-500 text-white rounded hover:bg-red-600'
+                  onClick={() => {
+                    setSignatureImage(null);
+                    setCurrentTool('highlight');
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className='mb-4'>
             <h4 className='text-lg font-bold mb-2'>Search</h4>
             <div className='flex gap-2'>
@@ -1055,28 +1098,6 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
               </p>
             )}
           </div>
-          {signatureImage && (
-            <div className='mt-4'>
-              <p className='text-sm mb-2'>Signature Preview:</p>
-              <div className='flex items-center gap-2'>
-                <img
-                  src={signatureImage}
-                  alt='Signature'
-                  className='max-w-full h-auto rounded border'
-                />
-                <button
-                  className='px-2 py-1 bg-red-500 text-white rounded hover:bg-red-600'
-                  onClick={() => {
-                    setSignatureImage(null);
-                    setCurrentTool('highlight');
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-          )}
-
           {/* Color Picker */}
           <div className='mb-4'>
             <label className='block text-sm font-medium mb-1'>Color:</label>
@@ -1087,7 +1108,6 @@ const PDFViewer: React.FC<PDFViewerProps> = ({
               className='h-10 w-full border border-gray-300 rounded'
             />
           </div>
-
           {/* Utility Buttons */}
           <div className='flex flex-col gap-2'>
             <button
